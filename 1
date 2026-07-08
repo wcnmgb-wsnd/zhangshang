@@ -1,0 +1,123 @@
+#include <Wire.h>
+#define SDA_PIN 7
+#define SCL_PIN 8
+
+#define MPU6050_ADDR 0x68
+
+// 寄存器地址定义
+#define ACCEL_XOUT_H 0x3B
+#define ACCEL_XOUT_L 0x3C
+#define ACCEL_YOUT_H 0x3D
+#define ACCEL_YOUT_L 0x3E
+#define ACCEL_ZOUT_H 0x3F
+#define ACCEL_ZOUT_L 0x40
+#define GYRO_XOUT_H  0x43
+#define GYRO_XOUT_L  0x44
+#define GYRO_YOUT_H  0x45
+#define GYRO_YOUT_L  0x46
+#define GYRO_ZOUT_H  0x47
+#define GYRO_ZOUT_L  0x48
+
+// 量程配置（根据初始化设置）
+#define ACCEL_SCALE 16384.0  // ±2g时：16384 LSB/g
+#define GYRO_SCALE  16.4     // ±2000°/s时：16.4 LSB/°/s
+
+// 变量定义
+int16_t accelX, accelY, accelZ;
+int16_t gyroX, gyroY, gyroZ;
+float accelX_g, accelY_g, accelZ_g;
+float gyroX_dps, gyroY_dps, gyroZ_dps;
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(SDA_PIN,SCL_PIN,400000);
+  
+  
+  // 1. 复位
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x6B);   // PWR_MGMT_1
+  Wire.write(0x80);   // DEVICE_RESET = 1
+  Wire.endTransmission(true);
+  delay(100);
+ 
+  // 2. 唤醒
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x6B);   // PWR_MGMT_1
+  Wire.write(0x00);   // SLEEP = 0
+  Wire.endTransmission(true);
+
+  
+  // 3. 配置陀螺仪 (±2000°/s)
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x1B);   // GYRO_CONFIG
+  Wire.write(0x08);   // FS_SEL = 2
+  Wire.endTransmission(true);
+ 
+  
+  // 4. 配置加速度计 (±2g)
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x1C);   // ACCEL_CONFIG
+  Wire.write(0x00);   // AFS_SEL = 0
+  Wire.endTransmission(true);
+
+  
+  // 5. 验证芯片
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x75);   // WHO_AM_I
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU6050_ADDR, 1);
+  if (Wire.available()) {
+    uint8_t whoami = Wire.read();
+    Serial.print("WHO_AM_I: 0x");
+    Serial.println(whoami, HEX);
+  }
+  delay(100);
+}
+
+void loop() {
+  // ========== 读取原始数据 ==========
+  // 读取加速度计（6个字节）
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(ACCEL_XOUT_H);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU6050_ADDR, 6, true);
+  
+  accelX = (Wire.read() << 8) | Wire.read();
+  accelY = (Wire.read() << 8) | Wire.read();
+  accelZ = (Wire.read() << 8) | Wire.read();
+  
+  // 读取陀螺仪（6个字节）
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(GYRO_XOUT_H);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU6050_ADDR, 6, true);
+  
+  gyroX = (Wire.read() << 8) | Wire.read();
+  gyroY = (Wire.read() << 8) | Wire.read();
+  gyroZ = (Wire.read() << 8) | Wire.read();
+  
+  // ========== 转换为物理值 ==========
+  // 加速度：原始值 / 16384 = g (重力加速度)
+  accelX_g = accelX / ACCEL_SCALE;
+  accelY_g = accelY / ACCEL_SCALE;
+  accelZ_g = accelZ / ACCEL_SCALE;
+  
+  // 陀螺仪：原始值 / 16.4 = °/s (度/秒)
+  gyroX_dps = gyroX / GYRO_SCALE;
+  gyroY_dps = gyroY / GYRO_SCALE;
+  gyroZ_dps = gyroZ / GYRO_SCALE;
+  
+  // ========== 打印数据 ==========
+  
+  Serial.print(accelX_g, 2); 
+  Serial.print(accelY_g, 2); 
+  Serial.print(accelZ_g, 2); 
+  
+  Serial.print(gyroX_dps, 2); 
+  Serial.print(gyroY_dps, 2); 
+  Serial.print(gyroZ_dps, 2); 
+  
+
+  
+  delay(500);  // 每500ms读取一次
+}
