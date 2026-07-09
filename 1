@@ -1,10 +1,21 @@
+/*
+ * ============================================
+ * MPU6050 最强姿态解算代码 + Yaw静态误差补偿
+ * 功能：零偏校准 + 互补滤波 + 欧拉角输出 + Yaw自动补偿
+ * 采样频率：100Hz
+ * 滤波：硬件DLPF 20Hz + 软件低通 10Hz
+ * ============================================
+ */
+
 #include <Wire.h>
+#include <math.h>
+
+// ==================== 引脚定义 ====================
 #define SDA_PIN 7
 #define SCL_PIN 8
-
 #define MPU6050_ADDR 0x68
 
-// 寄存器地址定义
+// ==================== 寄存器地址 ====================
 #define ACCEL_XOUT_H 0x3B
 #define ACCEL_XOUT_L 0x3C
 #define ACCEL_YOUT_H 0x3D
@@ -17,107 +28,548 @@
 #define GYRO_YOUT_L  0x46
 #define GYRO_ZOUT_H  0x47
 #define GYRO_ZOUT_L  0x48
+#define PWR_MGMT_1   0x6B
+#define GYRO_CONFIG  0x1B
+#define ACCEL_CONFIG 0x1C
+#define CONFIG       0x1A
+#define SMPLRT_DIV   0x19
+#define WHO_AM_I     0x75
 
-// 量程配置（根据初始化设置）
-#define ACCEL_SCALE 16384.0  // ±2g时：16384 LSB/g
-#define GYRO_SCALE  16.4     // ±2000°/s时：16.4 LSB/°/s
+// ==================== 量程配置 ====================
+#define ACCEL_SCALE 16384.0  // ±2g
+#define GYRO_SCALE  16.4     // ±2000°/s
 
-// 变量定义
-int16_t accelX, accelY, accelZ;
-int16_t gyroX, gyroY, gyroZ;
-float accelX_g, accelY_g, accelZ_g;
-float gyroX_dps, gyroY_dps, gyroZ_dps;
+// ==================== 滤波参数 ====================
+#define SAMPLE_FREQ 100.0           // 采样频率 100Hz
+#define DT (1.0 / SAMPLE_FREQ)      // 采样周期 0.01s
+#define TAU 0.91                    // 互补滤波时间常数 (秒)
+#define SOFT_LPF_CUTOFF 10.0        // 软件低通截止频率 10Hz
 
+// ==================== Yaw补偿参数 ====================
+#define STATIC_THRESHOLD 1.5        // 静止检测阈值 (°/s)
+#define BIAS_UPDATE_RATE 0.001      // 零偏更新速度 (越小越平滑)
+#define MAX_BIAS_COMPENSATION 10.0  // 最大补偿值限制 (°/s)
+
+// ==================== 全局变量 ====================
+// 原始数据
+int16_t accelX_raw, accelY_raw, accelZ_raw;
+int16_t gyroX_raw, gyroY_raw, gyroZ_raw;
+
+// 物理值（已校准）
+float accelX_f, accelY_f, accelZ_f;
+float gyroX_f, gyroY_f, gyroZ_f;
+
+// 零偏值（原始单位）
+float gyro_bias_x = 0, gyro_bias_y = 0, gyro_bias_z = 0;
+float accel_bias_x = 0, accel_bias_y = 0, accel_bias_z = 0;
+
+// ==================== Yaw补偿相关变量 ====================
+float gyro_bias_z_dynamic = 0;      // 动态零偏补偿值 (°/s)
+float gyro_z_filtered = 0;           // 滤波后的Z轴陀螺仪
+bool is_static = false;              // 静止标志
+unsigned long static_start_time = 0; // 静止开始时间
+float yaw_compensation = 0;          // Yaw补偿值
+
+// 欧拉角（度）
+float roll = 0.0, pitch = 0.0, yaw = 0.0;
+float roll_gyro = 0.0, pitch_gyro = 0.0;
+
+// 滤波变量
+float accelX_prev = 0, accelY_prev = 0, accelZ_prev = 0;
+float gyroX_prev = 0, gyroY_prev = 0, gyroZ_prev = 0;
+
+// 时间戳
+unsigned long last_time = 0;
+unsigned long loop_count = 0;
+
+// ==================== 软件低通滤波器类 ====================
+class LowPassFilter {
+private:
+  float y_prev;
+  float alpha;
+  
+public:
+  LowPassFilter() {
+    y_prev = 0.0;
+    alpha = 0.1;
+  }
+  
+  void init(float cutoff_freq, float sample_freq) {
+    if (cutoff_freq <= 0 || sample_freq <= 0) {
+      alpha = 0.1;
+      return;
+    }
+    float RC = 1.0 / (2.0 * M_PI * cutoff_freq);
+    float T = 1.0 / sample_freq;
+    alpha = T / (RC + T);
+    if (alpha > 0.9) alpha = 0.9;
+    if (alpha < 0.01) alpha = 0.01;
+  }
+  
+  float filter(float x) {
+    y_prev = alpha * x + (1.0 - alpha) * y_prev;
+    return y_prev;
+  }
+  
+  void reset() { y_prev = 0.0; }
+};
+
+// 创建滤波器实例
+LowPassFilter lpf_accel_x, lpf_accel_y, lpf_accel_z;
+LowPassFilter lpf_gyro_x, lpf_gyro_y, lpf_gyro_z;
+
+// ==================== 初始化 ====================
 void setup() {
   Serial.begin(115200);
-  Wire.begin(SDA_PIN,SCL_PIN,400000);
+  Wire.begin(SDA_PIN, SCL_PIN, 400000);
   
+  Serial.println("\n");
+  Serial.println("╔═══════════════════════════════════════════╗");
+  Serial.println("║  MPU6050 姿态解算 + Yaw自动补偿系统     ║");
+  Serial.println("║  V4.0 - 带静态误差补偿                  ║");
+  Serial.println("╚═══════════════════════════════════════════╝");
+  Serial.println();
   
-  // 1. 复位
-  Wire.beginTransmission(MPU6050_ADDR);
-  Wire.write(0x6B);   // PWR_MGMT_1
-  Wire.write(0x80);   // DEVICE_RESET = 1
-  Wire.endTransmission(true);
-  delay(100);
- 
-  // 2. 唤醒
-  Wire.beginTransmission(MPU6050_ADDR);
-  Wire.write(0x6B);   // PWR_MGMT_1
-  Wire.write(0x00);   // SLEEP = 0
-  Wire.endTransmission(true);
-
-  
-  // 3. 配置陀螺仪 (±2000°/s)
-  Wire.beginTransmission(MPU6050_ADDR);
-  Wire.write(0x1B);   // GYRO_CONFIG
-  Wire.write(0x08);   // FS_SEL = 2
-  Wire.endTransmission(true);
- 
-  
-  // 4. 配置加速度计 (±2g)
-  Wire.beginTransmission(MPU6050_ADDR);
-  Wire.write(0x1C);   // ACCEL_CONFIG
-  Wire.write(0x00);   // AFS_SEL = 0
-  Wire.endTransmission(true);
-
-  
-  // 5. 验证芯片
-  Wire.beginTransmission(MPU6050_ADDR);
-  Wire.write(0x75);   // WHO_AM_I
-  Wire.endTransmission(false);
-  Wire.requestFrom(MPU6050_ADDR, 1);
-  if (Wire.available()) {
-    uint8_t whoami = Wire.read();
-    Serial.print("WHO_AM_I: 0x");
-    Serial.println(whoami, HEX);
+  // 1. 初始化MPU6050硬件
+  if (!initMPU6050()) {
+    Serial.println("❌ MPU6050 初始化失败！");
+    while (1) delay(1000);
   }
-  delay(100);
+  
+  // 2. 初始化软件低通滤波器
+  lpf_accel_x.init(SOFT_LPF_CUTOFF, SAMPLE_FREQ);
+  lpf_accel_y.init(SOFT_LPF_CUTOFF, SAMPLE_FREQ);
+  lpf_accel_z.init(SOFT_LPF_CUTOFF, SAMPLE_FREQ);
+  lpf_gyro_x.init(SOFT_LPF_CUTOFF, SAMPLE_FREQ);
+  lpf_gyro_y.init(SOFT_LPF_CUTOFF, SAMPLE_FREQ);
+  lpf_gyro_z.init(SOFT_LPF_CUTOFF, SAMPLE_FREQ);
+  
+  // 3. 执行完整校准
+  calibrateSensors();
+  
+  // 4. 显示配置信息
+  printConfig();
+  
+  last_time = micros();
+  delay(500);
 }
 
-void loop() {
-  // ========== 读取原始数据 ==========
-  // 读取加速度计（6个字节）
+// ==================== MPU6050 硬件初始化 ====================
+bool initMPU6050() {
+  Serial.println("🔧 初始化 MPU6050 硬件...");
+  
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(PWR_MGMT_1);
+  Wire.write(0x80);
+  Wire.endTransmission(true);
+  delay(100);
+  
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(PWR_MGMT_1);
+  Wire.write(0x00);
+  Wire.endTransmission(true);
+  delay(100);
+  
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(GYRO_CONFIG);
+  Wire.write(0x08);
+  Wire.endTransmission(true);
+  
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(ACCEL_CONFIG);
+  Wire.write(0x00);
+  Wire.endTransmission(true);
+  
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(CONFIG);
+  Wire.write(0x04);
+  Wire.endTransmission(true);
+  
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(SMPLRT_DIV);
+  Wire.write(0x09);
+  Wire.endTransmission(true);
+  
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(WHO_AM_I);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU6050_ADDR, 1);
+  
+  if (Wire.available()) {
+    uint8_t whoami = Wire.read();
+    Serial.print("   WHO_AM_I: 0x");
+    Serial.println(whoami, HEX);
+    if (whoami == 0x68) {
+      Serial.println("   ✅ MPU6050 识别成功");
+      return true;
+    }
+  }
+  
+  Serial.println("   ❌ MPU6050 识别失败！");
+  return false;
+}
+
+// ==================== 传感器校准 ====================
+void calibrateSensors() {
+  Serial.println("\n🎯 开始传感器校准...");
+  Serial.println("⚠️  请将 MPU6050 水平静止放置！");
+  Serial.println("⏳ 校准将在 3 秒后开始...");
+  delay(3000);
+  
+  const int samples = 1000;
+  long sum_accel_x = 0, sum_accel_y = 0, sum_accel_z = 0;
+  long sum_gyro_x = 0, sum_gyro_y = 0, sum_gyro_z = 0;
+  
+  Serial.print("📊 采集数据中");
+  for (int i = 0; i < samples; i++) {
+    readRawData();
+    
+    sum_accel_x += accelX_raw;
+    sum_accel_y += accelY_raw;
+    sum_accel_z += accelZ_raw;
+    sum_gyro_x += gyroX_raw;
+    sum_gyro_y += gyroY_raw;
+    sum_gyro_z += gyroZ_raw;
+    
+    if (i % 100 == 0) Serial.print(".");
+    delay(2);
+  }
+  Serial.println(" ✅");
+  
+  accel_bias_x = sum_accel_x / (float)samples;
+  accel_bias_y = sum_accel_y / (float)samples;
+  accel_bias_z = (sum_accel_z / (float)samples) - ACCEL_SCALE;
+  
+  gyro_bias_x = sum_gyro_x / (float)samples;
+  gyro_bias_y = sum_gyro_y / (float)samples;
+  gyro_bias_z = sum_gyro_z / (float)samples;
+  
+  Serial.println("\n📋 校准结果：");
+  Serial.println("┌─────────────────────────────────────────┐");
+  Serial.println("│  传感器   │  零偏(原始值)  │  零偏(物理值) │");
+  Serial.println("├─────────────────────────────────────────┤");
+  Serial.print("│  加速度X  │  ");
+  Serial.print(accel_bias_x, 1);
+  Serial.print("      │  ");
+  Serial.print(accel_bias_x / ACCEL_SCALE, 3);
+  Serial.println(" g      │");
+  Serial.print("│  加速度Y  │  ");
+  Serial.print(accel_bias_y, 1);
+  Serial.print("      │  ");
+  Serial.print(accel_bias_y / ACCEL_SCALE, 3);
+  Serial.println(" g      │");
+  Serial.print("│  加速度Z  │  ");
+  Serial.print(accel_bias_z, 1);
+  Serial.print("      │  ");
+  Serial.print(accel_bias_z / ACCEL_SCALE, 3);
+  Serial.println(" g      │");
+  Serial.print("│  陀螺仪X  │  ");
+  Serial.print(gyro_bias_x, 1);
+  Serial.print("      │  ");
+  Serial.print(gyro_bias_x / GYRO_SCALE, 3);
+  Serial.println(" °/s    │");
+  Serial.print("│  陀螺仪Y  │  ");
+  Serial.print(gyro_bias_y, 1);
+  Serial.print("      │  ");
+  Serial.print(gyro_bias_y / GYRO_SCALE, 3);
+  Serial.println(" °/s    │");
+  Serial.print("│  陀螺仪Z  │  ");
+  Serial.print(gyro_bias_z, 1);
+  Serial.print("      │  ");
+  Serial.print(gyro_bias_z / GYRO_SCALE, 3);
+  Serial.println(" °/s    │");
+  Serial.println("└─────────────────────────────────────────┘");
+  
+  Serial.println("✅ 校准完成！\n");
+}
+
+// ==================== 读取原始数据 ====================
+void readRawData() {
   Wire.beginTransmission(MPU6050_ADDR);
   Wire.write(ACCEL_XOUT_H);
   Wire.endTransmission(false);
   Wire.requestFrom(MPU6050_ADDR, 6, true);
   
-  accelX = (Wire.read() << 8) | Wire.read();
-  accelY = (Wire.read() << 8) | Wire.read();
-  accelZ = (Wire.read() << 8) | Wire.read();
+  accelX_raw = (Wire.read() << 8) | Wire.read();
+  accelY_raw = (Wire.read() << 8) | Wire.read();
+  accelZ_raw = (Wire.read() << 8) | Wire.read();
   
-  // 读取陀螺仪（6个字节）
   Wire.beginTransmission(MPU6050_ADDR);
   Wire.write(GYRO_XOUT_H);
   Wire.endTransmission(false);
   Wire.requestFrom(MPU6050_ADDR, 6, true);
   
-  gyroX = (Wire.read() << 8) | Wire.read();
-  gyroY = (Wire.read() << 8) | Wire.read();
-  gyroZ = (Wire.read() << 8) | Wire.read();
-  
-  // ========== 转换为物理值 ==========
-  // 加速度：原始值 / 16384 = g (重力加速度)
-  accelX_g = accelX / ACCEL_SCALE;
-  accelY_g = accelY / ACCEL_SCALE;
-  accelZ_g = accelZ / ACCEL_SCALE;
-  
-  // 陀螺仪：原始值 / 16.4 = °/s (度/秒)
-  gyroX_dps = gyroX / GYRO_SCALE;
-  gyroY_dps = gyroY / GYRO_SCALE;
-  gyroZ_dps = gyroZ / GYRO_SCALE;
-  
-  // ========== 打印数据 ==========
-  
-  Serial.print(accelX_g, 2); 
-  Serial.print(accelY_g, 2); 
-  Serial.print(accelZ_g, 2); 
-  
-  Serial.print(gyroX_dps, 2); 
-  Serial.print(gyroY_dps, 2); 
-  Serial.print(gyroZ_dps, 2); 
-  
-
-  
-  delay(500);  // 每500ms读取一次
+  gyroX_raw = (Wire.read() << 8) | Wire.read();
+  gyroY_raw = (Wire.read() << 8) | Wire.read();
+  gyroZ_raw = (Wire.read() << 8) | Wire.read();
 }
+
+// ==================== 数据处理（去零偏 + 滤波） ====================
+void processData() {
+  float accelX_cal = accelX_raw - accel_bias_x;
+  float accelY_cal = accelY_raw - accel_bias_y;
+  float accelZ_cal = accelZ_raw - accel_bias_z;
+  
+  float gyroX_cal = gyroX_raw - gyro_bias_x;
+  float gyroY_cal = gyroY_raw - gyro_bias_y;
+  float gyroZ_cal = gyroZ_raw - gyro_bias_z;
+  
+  float accelX_g = accelX_cal / ACCEL_SCALE;
+  float accelY_g = accelY_cal / ACCEL_SCALE;
+  float accelZ_g = accelZ_cal / ACCEL_SCALE;
+  
+  float gyroX_dps = gyroX_cal / GYRO_SCALE;
+  float gyroY_dps = gyroY_cal / GYRO_SCALE;
+  float gyroZ_dps = gyroZ_cal / GYRO_SCALE;
+  
+  accelX_f = lpf_accel_x.filter(accelX_g);
+  accelY_f = lpf_accel_y.filter(accelY_g);
+  accelZ_f = lpf_accel_z.filter(accelZ_g);
+  
+  gyroX_f = lpf_gyro_x.filter(gyroX_dps);
+  gyroY_f = lpf_gyro_y.filter(gyroY_dps);
+  gyroZ_f = lpf_gyro_z.filter(gyroZ_dps);
+}
+
+// ==================== 【新增】静止检测函数 ====================
+bool detectStatic() {
+  // 检测三轴陀螺仪是否都接近0
+  if (fabs(gyroX_f) < STATIC_THRESHOLD && 
+      fabs(gyroY_f) < STATIC_THRESHOLD && 
+      fabs(gyroZ_f) < STATIC_THRESHOLD) {
+    return true;
+  }
+  return false;
+}
+
+// ==================== 【新增】动态零偏更新 ====================
+void updateDynamicBias() {
+  // 低通滤波陀螺仪Z轴（平滑噪声）
+  gyro_z_filtered = 0.95 * gyro_z_filtered + 0.05 * gyroZ_f;
+  
+  // 静止检测
+  bool current_static = detectStatic();
+  
+  if (current_static) {
+    if (!is_static) {
+      // 刚进入静止状态，记录时间
+      is_static = true;
+      static_start_time = millis();
+    }
+    
+    // 静止持续超过2秒，开始更新零偏
+    if (millis() - static_start_time > 2000) {
+      // 使用滤波后的值缓慢更新零偏
+      gyro_bias_z_dynamic = (1.0 - BIAS_UPDATE_RATE) * gyro_bias_z_dynamic + 
+                            BIAS_UPDATE_RATE * gyro_z_filtered;
+      
+      // 限制最大补偿值（防止异常数据污染）
+      if (fabs(gyro_bias_z_dynamic) > MAX_BIAS_COMPENSATION) {
+        gyro_bias_z_dynamic = 0;
+      }
+    }
+  } else {
+    // 运动状态，重置静止计时
+    is_static = false;
+    static_start_time = 0;
+  }
+}
+
+// ==================== 【修改】互补滤波姿态解算（带Yaw补偿） ====================
+void updateAttitude(float dt) {
+  // 1. 更新动态零偏
+  updateDynamicBias();
+  
+  // 2. 从加速度计计算角度（静态）
+  float roll_acc = atan2(accelY_f, accelZ_f) * 180.0 / M_PI;
+  float pitch_acc = atan2(-accelX_f, sqrt(accelY_f * accelY_f + accelZ_f * accelZ_f)) * 180.0 / M_PI;
+  
+  // 3. 从陀螺仪积分计算角度（动态）
+  roll_gyro += gyroX_f * dt;
+  pitch_gyro += gyroY_f * dt;
+  
+  // ===== 关键：Yaw积分时减去动态零偏 =====
+  float gyroZ_compensated = gyroZ_f - gyro_bias_z_dynamic;
+  yaw += gyroZ_compensated * dt;
+  
+  // 4. 互补滤波融合（Roll和Pitch）
+  float alpha = TAU / (TAU + dt);
+  roll = alpha * roll_gyro + (1.0 - alpha) * roll_acc;
+  pitch = alpha * pitch_gyro + (1.0 - alpha) * pitch_acc;
+  
+  // 5. 修正陀螺仪积分（防止累积漂移）
+  roll_gyro = roll;
+  pitch_gyro = pitch;
+  
+  // 6. 角度范围限制
+  if (roll > 180) roll -= 360;
+  if (roll < -180) roll += 360;
+  if (pitch > 90) pitch = 90;
+  if (pitch < -90) pitch = -90;
+  
+  // 7. Yaw归一化到 -180° ~ 180°
+  if (yaw > 180.0) yaw -= 360.0;
+  if (yaw < -180.0) yaw += 360.0;
+}
+
+// ==================== 打印配置信息 ====================
+void printConfig() {
+  Serial.println("⚙️  系统配置：");
+  Serial.println("┌─────────────────────────────────────────┐");
+  Serial.print("│  采样频率: ");
+  Serial.print(SAMPLE_FREQ);
+  Serial.println(" Hz                      │");
+  Serial.print("│  互补滤波τ: ");
+  Serial.print(TAU);
+  Serial.println(" 秒                      │");
+  Serial.print("│  硬件DLPF: 20Hz                         │");
+  Serial.println("│");
+  Serial.print("│  软件LPF: ");
+  Serial.print(SOFT_LPF_CUTOFF);
+  Serial.println(" Hz                       │");
+  Serial.print("│  静止阈值: ");
+  Serial.print(STATIC_THRESHOLD);
+  Serial.println(" °/s                    │");
+  Serial.print("│  零偏更新率: ");
+  Serial.print(BIAS_UPDATE_RATE * 100);
+  Serial.println("%                      │");
+  Serial.println("└─────────────────────────────────────────┘");
+  Serial.println();
+  Serial.println("🚀 系统就绪，开始输出数据...\n");
+}
+
+// ==================== 【修改】打印数据（增加补偿信息） ====================
+void printData() {
+  Serial.println("╔═══════════════════════════════════════════════════════╗");
+  Serial.println("║              MPU6050 姿态数据 + Yaw补偿              ║");
+  Serial.println("╠═══════════════════════════════════════════════════════╣");
+  
+  // 欧拉角
+  Serial.print("║  欧拉角  │  Roll: ");
+  Serial.print(roll, 2);
+  Serial.print("°  Pitch: ");
+  Serial.print(pitch, 2);
+  Serial.print("°  Yaw: ");
+  Serial.print(yaw, 2);
+  Serial.println("°      ║");
+  
+  // 加速度
+  Serial.print("║  加速度  │  X: ");
+  Serial.print(accelX_f, 3);
+  Serial.print("g  Y: ");
+  Serial.print(accelY_f, 3);
+  Serial.print("g  Z: ");
+  Serial.print(accelZ_f, 3);
+  Serial.println("g     ║");
+  
+  // 陀螺仪
+  Serial.print("║  陀螺仪  │  X: ");
+  Serial.print(gyroX_f, 2);
+  Serial.print("°/s  Y: ");
+  Serial.print(gyroY_f, 2);
+  Serial.print("°/s  Z: ");
+  Serial.print(gyroZ_f, 2);
+  Serial.println("°/s   ║");
+  
+  // ===== 【新增】补偿信息 =====
+  Serial.print("║  补偿    │  动态零偏: ");
+  Serial.print(gyro_bias_z_dynamic, 3);
+  Serial.print("°/s  静止: ");
+  Serial.print(is_static ? "是" : "否");
+  Serial.println("      ║");
+  
+  // 状态
+  Serial.print("║  状态    │  采样: ");
+  Serial.print(loop_count);
+  Serial.print("  ");
+  
+  // 质量检测
+  bool accel_ok = (fabs(accelZ_f - 1.0) < 0.1);
+  bool gyro_ok = (fabs(gyroX_f) < 2.0 && fabs(gyroY_f) < 2.0 && fabs(gyroZ_f) < 2.0);
+  
+  if (accel_ok && gyro_ok) {
+    Serial.print("✅ 数据质量: 优秀  ");
+  } else if (accel_ok || gyro_ok) {
+    Serial.print("⚠️  数据质量: 一般  ");
+  } else {
+    Serial.print("❌ 数据质量: 较差  ");
+  }
+  Serial.println("  ║");
+  
+  Serial.println("╚═══════════════════════════════════════════════════════╝");
+  Serial.println();
+}
+
+// ==================== 主循环 ====================
+void loop() {
+  unsigned long now = micros();
+  float dt = (now - last_time) / 1000000.0;
+  
+  if (dt > 0.1) dt = DT;
+  if (dt <= 0) dt = DT;
+  
+  last_time = now;
+  
+  readRawData();
+  processData();
+  updateAttitude(dt);
+  
+  loop_count++;
+  if (loop_count % 2 == 0) {
+    printData();
+  }
+  
+  int delay_time = (int)(DT * 1000) - 2;
+  if (delay_time > 0) {
+    delay(delay_time);
+  }
+}
+
+// ==================== 额外工具函数 ====================
+
+float getYaw() { return yaw; }
+float getRoll() { return roll; }
+float getPitch() { return pitch; }
+
+void getAccel(float &x, float &y, float &z) {
+  x = accelX_f;
+  y = accelY_f;
+  z = accelZ_f;
+}
+
+void getGyro(float &x, float &y, float &z) {
+  x = gyroX_f;
+  y = gyroY_f;
+  z = gyroZ_f;
+}
+
+void resetYaw() {
+  yaw = 0;
+  roll_gyro = roll;
+  pitch_gyro = pitch;
+  gyro_bias_z_dynamic = 0;  // 重置动态零偏
+}
+
+void resetAngles() {
+  roll = 0;
+  pitch = 0;
+  yaw = 0;
+  roll_gyro = 0;
+  pitch_gyro = 0;
+  gyro_bias_z_dynamic = 0;
+}
+
+String getStatus() {
+  float accel_mag = sqrt(accelX_f*accelX_f + accelY_f*accelY_f + accelZ_f*accelZ_f);
+  if (fabs(accel_mag - 1.0) < 0.05) {
+    return "NORMAL";
+  } else if (fabs(accel_mag - 1.0) < 0.2) {
+    return "WARNING";
+  } else {
+    return "ERROR";
+  }
+}
+
+// ==================== 获取补偿状态（新增） ====================
+float getDynamicBias() { return gyro_bias_z_dynamic; }
+bool isSensorStatic() { return is_static; }
